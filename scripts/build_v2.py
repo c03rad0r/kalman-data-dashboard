@@ -1,4 +1,56 @@
-<!DOCTYPE html>
+#!/usr/bin/env python3
+"""
+build_v2.py — Generate Kalman dashboard that fetches data.json on load.
+Solves the "datapoints lost on reload" problem by serving ALL historical
+data from a same-origin JSON file instead of a frozen baked-in snapshot.
+
+Deploy alongside data.json to nsite. Frontend auto-polls data.json every
+2 minutes for fresh data without requiring a page reload.
+"""
+
+import sqlite3, json, os
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
+OUT_HTML = Path.home() / "nsites" / "kalman-data" / "index.html"
+OUT_JSON = Path.home() / "nsites" / "kalman-data" / "data.json"
+NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+
+
+def generate_data_json():
+    """Export ALL kalman samples to compact JSON."""
+    db = sqlite3.connect(str(DB))
+    rows = db.execute("""
+        SELECT ts, burn_rate_tph, projected_total_pct, used_pct_observed,
+               uncertainty, will_exhaust, velocity_tph2, exhausts_in_hours
+        FROM kalman_samples ORDER BY ts ASC
+    """).fetchall()
+    anom_rows = db.execute("""
+        SELECT ts, severity, title FROM anomaly_events ORDER BY ts DESC LIMIT 20
+    """).fetchall()
+    db.close()
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sample_count": len(rows),
+        "times": [r[0] * 1000 for r in rows],
+        "burn_rate": [min(r[1] or 0, 50000) for r in rows],
+        "projected_pct": [r[2] or 0 for r in rows],
+        "used_pct": [r[3] or 0 for r in rows],
+        "uncertainty": [min(r[4] or 0, 50000) for r in rows],
+        "will_exhaust": [bool(r[5]) for r in rows],
+        "exhausts_in_hours": [r[7] for r in rows],
+        "anomalies": [{"ts": r[0], "severity": r[1], "title": r[2]} for r in anom_rows],
+    }
+    with open(OUT_JSON, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    return len(rows)
+
+
+def generate_html():
+    """Generate dashboard HTML that fetches data.json dynamically."""
+    html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -132,4 +184,17 @@ loadData();
 // Auto-refresh every 2 minutes
 setInterval(loadData, 120000);
 </script>
-</body></html>
+</body></html>"""
+
+    with open(OUT_HTML, "w") as f:
+        f.write(html)
+    return len(html)
+
+
+if __name__ == "__main__":
+    n = generate_data_json()
+    size = generate_html()
+    json_size = os.path.getsize(OUT_JSON) / 1024
+    print(f"data.json: {json_size:.0f} KB ({n} samples)")
+    print(f"index.html: {size/1024:.0f} KB")
+    print(f"Output: {OUT_HTML.parent}")

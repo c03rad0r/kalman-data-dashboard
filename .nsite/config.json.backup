@@ -1,0 +1,18 @@
+{
+  "$schema": "https://nsyte.run/schemas/config.schema.json",
+  "relays": [
+    "wss://relay.ngit.dev",
+    "wss://nos.lol"
+  ],
+  "servers": [
+    "https://blossom.primal.net",
+    "https://cdn.hzrd149.com",
+    "https://cdn.sovbit.host",
+    "https://cdn.nostrcheck.me",
+    "https://nostr.download"
+  ],
+  "id": null,
+  "gatewayHostnames": [
+    "nsite.lol"
+  ]
+}
