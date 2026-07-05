@@ -1,4 +1,229 @@
-<!DOCTYPE html>
+#!/usr/bin/env python3
+"""
+build_v3.py — Enhanced Kalman dashboard v3.
+
+Improvements over v2:
+- Logarithmic y-axis toggle on "Predicted vs Actual Usage"
+- Rich anomaly explanations with detail JSON context
+- API key switching timeline with human-readable reasons
+- Token cost visualization with cost-driver annotations
+
+Deploy alongside data.json to nsite.
+"""
+
+import sqlite3, json, os, re
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
+OUT_HTML = Path.home() / "nsites" / "kalman-data" / "index.html"
+OUT_JSON = Path.home() / "nsites" / "kalman-data" / "data.json"
+NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+
+
+def humanize_reason(reason):
+    """Convert a machine reason string into a human-readable explanation."""
+    if not reason:
+        return "unknown"
+
+    # Parse the reason patterns
+    if "only_available_ours_locked" in reason:
+        # Extract the window and percentage
+        m = re.search(r'ours_locked_(\w+?)_(\d+)pct', reason)
+        window = m.group(1) if m else "?"
+        pct = m.group(2) if m else "?"
+        return f"Switched to friend's key — ours hit {pct}% on {window} window"
+
+    if "only_available_friend_locked" in reason:
+        m = re.search(r'friend_locked_(\w+?)_(\d+)pct', reason)
+        window = m.group(1) if m else "?"
+        pct = m.group(2) if m else "?"
+        return f"Switched to our key — friend's hit {pct}% on {window} window"
+
+    if "fallback_both_locked" in reason:
+        m = re.search(r'ours_(\w+?)_(\d+)pct_friend_(\w+?)_(\d+)pct', reason)
+        if m:
+            our_w, our_p, fri_w, fri_p = m.groups()
+            if "error" in our_w or "999" in our_p:
+                return f"Both keys locked/error — using whatever responds (ours: error, friend: {fri_p}% {fri_w})"
+            return f"Both keys over quota — ours {our_p}% {our_w}, friend {fri_p}% {fri_w}"
+        return "Both keys locked — emergency fallback"
+
+    if "prefer_ours_both_unlocked" in reason:
+        m = re.search(r'ours_(\d+)_friend_(\d+)', reason)
+        if m:
+            our_p, fri_p = m.groups()
+            return f"Both available — prefer ours ({our_p}% used, friend at {fri_p}%)"
+        return "Both keys available — prefer ours"
+
+    if "ours_unlocked_higher_quota" in reason:
+        return "Our key has more remaining quota"
+    if "friend_unlocked_higher_quota" in reason:
+        return "Friend's key has more remaining quota"
+    if "lowest_quota" in reason:
+        return "Selected key with lowest usage"
+    if "default_preferred" in reason:
+        return "Default preference (ours)"
+    if "friend_blocked" in reason:
+        return "Friend's key is blocked"
+    if "ours_blocked" in reason:
+        return "Our key is blocked"
+
+    return reason.replace("_", " ")
+
+
+def generate_data_json():
+    """Export ALL data to compact JSON."""
+    db = sqlite3.connect(str(DB))
+
+    # Kalman samples
+    rows = db.execute("""
+        SELECT ts, burn_rate_tph, projected_total_pct, used_pct_observed,
+               uncertainty, will_exhaust, velocity_tph2, exhausts_in_hours
+        FROM kalman_samples ORDER BY ts ASC
+    """).fetchall()
+
+    # Anomalies with detail
+    anom_rows = db.execute("""
+        SELECT ts, severity, category, title, detail
+        FROM anomaly_events ORDER BY ts DESC LIMIT 20
+    """).fetchall()
+
+    # Key transitions (actual switches, not repeated decisions)
+    kd_rows = db.execute("""
+        SELECT ts, chosen_key, reason, ours_pct, friend_pct,
+               ours_available, friend_available
+        FROM key_decisions ORDER BY ts ASC
+    """).fetchall()
+
+    transitions = []
+    prev_key = None
+    for ts, key, reason, ours_pct, friend_pct, ours_avail, friend_avail in kd_rows:
+        if key != prev_key:
+            transitions.append({
+                "ts": ts,
+                "from": prev_key,
+                "to": key,
+                "reason_raw": reason,
+                "reason_human": humanize_reason(reason),
+                "ours_pct": ours_pct,
+                "friend_pct": friend_pct,
+            })
+            prev_key = key
+
+    # API call stats aggregated hourly per key
+    api_stats = db.execute("""
+        SELECT
+            CAST(ts / 3600 AS INTEGER) * 3600 as hour_ts,
+            key_name,
+            COUNT(*) as calls,
+            SUM(total_tokens) as tokens,
+            SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
+            SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) as success,
+            AVG(duration_ms) as avg_duration
+        FROM api_calls
+        WHERE ts > (SELECT MAX(ts) - 86400*7 FROM api_calls)
+        GROUP BY hour_ts, key_name
+        ORDER BY hour_ts ASC
+    """).fetchall()
+
+    # Overall key usage summary
+    key_summary = db.execute("""
+        SELECT key_name,
+            COUNT(*) as calls,
+            SUM(total_tokens) as tokens,
+            SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
+            SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) as success
+        FROM api_calls
+        GROUP BY key_name
+    """).fetchall()
+
+    db.close()
+
+    # Build anomalies with enriched detail
+    anomalies = []
+    for ts, sev, cat, title, detail_json in anom_rows:
+        detail = {}
+        if detail_json:
+            try:
+                detail = json.loads(detail_json)
+            except:
+                detail = {"raw": detail_json}
+
+        # Create human-readable explanation
+        explanation = title
+        if cat == "task_duration" and detail:
+            task_id = detail.get("task_id", "?")
+            profile = detail.get("profile", "?")
+            ratio = detail.get("ratio", 0)
+            expected = detail.get("expected_sec", 0)
+            elapsed = detail.get("elapsed_sec", 0)
+            baseline = detail.get("baseline", "?")
+            explanation = (
+                f"Worker '{profile}' (task {task_id[:12]}) took {elapsed:.0f}s "
+                f"vs expected {expected:.0f}s ({ratio:.1f}x slower). "
+                f"Baseline: {baseline}. "
+                f"This likely means the task hit an unexpected complication "
+                f"(build failure retry, network timeout, or large diff)."
+            )
+
+        anomalies.append({
+            "ts": ts,
+            "severity": sev,
+            "category": cat or "general",
+            "title": title,
+            "explanation": explanation,
+            "detail": detail,
+        })
+
+    # Build hourly API data for chart
+    hour_times = sorted(set(r[0] for r in api_stats))
+    keys_present = sorted(set(r[1] for r in api_stats if r[1]))
+
+    api_hourly = {k: {"times": [], "tokens": [], "calls": []} for k in keys_present}
+    for hour_ts, key_name, calls, tokens, cache, success, avg_dur in api_stats:
+        if key_name and key_name in api_hourly:
+            api_hourly[key_name]["times"].append(hour_ts * 1000)
+            api_hourly[key_name]["tokens"].append(tokens or 0)
+            api_hourly[key_name]["calls"].append(calls or 0)
+
+    # Key summary
+    key_summaries = []
+    for key_name, calls, tokens, cache, success in key_summary:
+        if not key_name:
+            continue
+        key_summaries.append({
+            "key": key_name,
+            "calls": calls,
+            "tokens_millions": round((tokens or 0) / 1_000_000, 1),
+            "cache_hits": cache or 0,
+            "success_rate": round((success or 0) / calls * 100, 1) if calls else 0,
+        })
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sample_count": len(rows),
+        "times": [r[0] * 1000 for r in rows],
+        "burn_rate": [min(r[1] or 0, 50000) for r in rows],
+        "projected_pct": [r[2] or 0 for r in rows],
+        "used_pct": [r[3] or 0 for r in rows],
+        "uncertainty": [min(r[4] or 0, 50000) for r in rows],
+        "will_exhaust": [bool(r[5]) for r in rows],
+        "exhausts_in_hours": [r[7] for r in rows],
+        "anomalies": anomalies,
+        "key_transitions": transitions,
+        "api_hourly": api_hourly,
+        "key_summaries": key_summaries,
+    }
+
+    with open(OUT_JSON, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    return len(rows)
+
+
+def generate_html():
+    """Generate dashboard HTML with all enhancements."""
+    html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -280,4 +505,17 @@ async function loadData() {
 loadData();
 setInterval(loadData, 120000);
 </script>
-</body></html>
+</body></html>"""
+
+    with open(OUT_HTML, "w") as f:
+        f.write(html)
+    return len(html)
+
+
+if __name__ == "__main__":
+    n = generate_data_json()
+    size = generate_html()
+    json_size = os.path.getsize(OUT_JSON) / 1024
+    print(f"data.json: {json_size:.0f} KB ({n} samples)")
+    print(f"index.html: {size/1024:.0f} KB")
+    print(f"Output: {OUT_HTML.parent}")
