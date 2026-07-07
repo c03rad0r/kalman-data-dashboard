@@ -1,61 +1,56 @@
 #!/usr/bin/env python3
-"""
-build_v3.py — Enhanced Kalman dashboard v3.
+"""build_v3.py — Enhanced Kalman dashboard v3 (SATs edition).
 
-Improvements over v2:
-- Logarithmic y-axis toggle on "Predicted vs Actual Usage"
-- Rich anomaly explanations with detail JSON context
-- API key switching timeline with human-readable reasons
-- Token cost visualization with cost-driver annotations
-
-Deploy alongside data.json to nsite.
+v3.1 improvements:
+- SATs burned per hour instead of raw tokens on chart c3
+- PPQ.ai tokens included in hourly timeline
+- Log-scale y-axis toggle on chart c3
+- Price-per-token computed from flat-rate (z.ai: 144/mo) / top-up (PPQ: BTC->USD)
+- BTC price feed from CoinGecko
 """
 
-import sqlite3, json, os, re
+import sqlite3, json, os, re, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
+BURN_DB = Path.home() / ".hermes" / "bot" / "api_burn.db"
 OUT_HTML = Path.home() / "nsites" / "kalman-data" / "index.html"
 OUT_JSON = Path.home() / "nsites" / "kalman-data" / "data.json"
 NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
 
+# Price config
+ZAI_MONTHLY_EUR = 144.0
+BTCOINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=eur,usd"
+
 
 def humanize_reason(reason):
-    """Convert a machine reason string into a human-readable explanation."""
     if not reason:
         return "unknown"
-
-    # Parse the reason patterns
     if "only_available_ours_locked" in reason:
-        # Extract the window and percentage
         m = re.search(r'ours_locked_(\w+?)_(\d+)pct', reason)
         window = m.group(1) if m else "?"
         pct = m.group(2) if m else "?"
-        return f"Switched to friend's key — ours hit {pct}% on {window} window"
-
+        return f"Switched to friend's key - ours hit {pct}% on {window} window"
     if "only_available_friend_locked" in reason:
         m = re.search(r'friend_locked_(\w+?)_(\d+)pct', reason)
         window = m.group(1) if m else "?"
         pct = m.group(2) if m else "?"
-        return f"Switched to our key — friend's hit {pct}% on {window} window"
-
+        return f"Switched to our key - friend's hit {pct}% on {window} window"
     if "fallback_both_locked" in reason:
         m = re.search(r'ours_(\w+?)_(\d+)pct_friend_(\w+?)_(\d+)pct', reason)
         if m:
             our_w, our_p, fri_w, fri_p = m.groups()
             if "error" in our_w or "999" in our_p:
-                return f"Both keys locked/error — using whatever responds (ours: error, friend: {fri_p}% {fri_w})"
-            return f"Both keys over quota — ours {our_p}% {our_w}, friend {fri_p}% {fri_w}"
-        return "Both keys locked — emergency fallback"
-
+                return f"Both keys locked/error - ours: error, friend: {fri_p}% {fri_w}"
+            return f"Both keys over quota - ours {our_p}% {our_w}, friend {fri_p}% {fri_w}"
+        return "Both keys locked - emergency fallback"
     if "prefer_ours_both_unlocked" in reason:
         m = re.search(r'ours_(\d+)_friend_(\d+)', reason)
         if m:
             our_p, fri_p = m.groups()
-            return f"Both available — prefer ours ({our_p}% used, friend at {fri_p}%)"
-        return "Both keys available — prefer ours"
-
+            return f"Both available - prefer ours ({our_p}% used, friend at {fri_p}%)"
+        return "Both keys available - prefer ours"
     if "ours_unlocked_higher_quota" in reason:
         return "Our key has more remaining quota"
     if "friend_unlocked_higher_quota" in reason:
@@ -68,12 +63,95 @@ def humanize_reason(reason):
         return "Friend's key is blocked"
     if "ours_blocked" in reason:
         return "Our key is blocked"
-
     return reason.replace("_", " ")
 
 
+def fetch_btc_price():
+    """Fetch current BTC price from CoinGecko. Returns {eur, usd}."""
+    try:
+        req = urllib.request.Request(BTCOINGECKO_URL, headers={"User-Agent": "Hermes/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return {
+            "eur": data.get("bitcoin", {}).get("eur", 0),
+            "usd": data.get("bitcoin", {}).get("usd", 0),
+        }
+    except Exception as e:
+        print(f"WARN: BTC price fetch failed: {e}")
+        return {"eur": 0, "usd": 0}
+
+
+def compute_sats_per_token():
+    """Compute SATs-per-token for z.ai and PPQ.
+
+    z.ai: 144/mo flat rate  30-day token burn = /token  SATs via BTC/EUR
+    PPQ:  balance_snapshots (USD spent / tokens used)  SATs via BTC/USD
+    """
+    btc = fetch_btc_price()
+    result = {"ours": 0, "friend": 0, "ppq": 0}
+
+    db = sqlite3.connect(str(DB))
+    cutoff_30d = datetime.now(timezone.utc).timestamp() - 86400 * 30
+
+    # z.ai price
+    row = db.execute("""
+        SELECT SUM(total_tokens)
+        FROM api_calls
+        WHERE ts > ? AND ppq_hit = 0 AND status_code = 200
+          AND key_name IN ('ours','friend')
+    """, (cutoff_30d,)).fetchone()
+    monthly_tokens = row[0] or 1
+    eur_per_token = ZAI_MONTHLY_EUR / monthly_tokens
+    if btc["eur"] > 0:
+        result["ours"] = (eur_per_token / btc["eur"]) * 100_000_000
+        result["friend"] = result["ours"]
+    else:
+        result["ours"] = 0
+        result["friend"] = 0
+
+    # PPQ price - from balance_snapshots
+    try:
+        bdb = sqlite3.connect(str(BURN_DB))
+        ppq_rows = bdb.execute("""
+            SELECT ts, balance_usd FROM balance_snapshots
+            WHERE provider='ppq' AND balance_usd IS NOT NULL AND error IS NULL
+            ORDER BY ts DESC LIMIT 2
+        """).fetchall()
+        bdb.close()
+        if len(ppq_rows) >= 2:
+            latest = ppq_rows[0]
+            previous = ppq_rows[1]
+            ppq_tokens = db.execute("""
+                SELECT SUM(total_tokens) FROM api_calls
+                WHERE ppq_hit=1 AND ts BETWEEN ? AND ?
+            """, (previous[0], latest[0])).fetchone()[0] or 1
+            usd_spent = previous[1] - latest[1]
+            usd_per_token = usd_spent / ppq_tokens if usd_spent > 0 else 0
+        else:
+            usd_per_token = 0.50 / 1_000_000  # fallback: 50/M
+    except Exception:
+        usd_per_token = 0
+
+    if btc["usd"] > 0 and usd_per_token > 0:
+        result["ppq"] = (usd_per_token / btc["usd"]) * 100_000_000
+
+    db.close()
+    return result, btc
+
+
+def format_sats(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    elif n >= 1:
+        return f"{n:.1f}"
+    else:
+        return f"{n:.4f}"
+
+
 def generate_data_json():
-    """Export ALL data to compact JSON."""
+    """Export ALL data to compact JSON with SATs pricing."""
     db = sqlite3.connect(str(DB))
 
     # Kalman samples
@@ -83,13 +161,13 @@ def generate_data_json():
         FROM kalman_samples ORDER BY ts ASC
     """).fetchall()
 
-    # Anomalies with detail
+    # Anomalies
     anom_rows = db.execute("""
         SELECT ts, severity, category, title, detail
         FROM anomaly_events ORDER BY ts DESC LIMIT 20
     """).fetchall()
 
-    # Key transitions (actual switches, not repeated decisions)
+    # Key transitions
     kd_rows = db.execute("""
         SELECT ts, chosen_key, reason, ours_pct, friend_pct,
                ours_available, friend_available
@@ -98,7 +176,7 @@ def generate_data_json():
 
     transitions = []
     prev_key = None
-    for ts, key, reason, ours_pct, friend_pct, ours_avail, friend_avail in kd_rows:
+    for ts, key, reason, ours_p, friend_p, ours_avail, friend_avail in kd_rows:
         if key != prev_key:
             transitions.append({
                 "ts": ts,
@@ -106,12 +184,12 @@ def generate_data_json():
                 "to": key,
                 "reason_raw": reason,
                 "reason_human": humanize_reason(reason),
-                "ours_pct": ours_pct,
-                "friend_pct": friend_pct,
+                "ours_pct": ours_p,
+                "friend_pct": friend_p,
             })
             prev_key = key
 
-    # API call stats aggregated hourly per key
+    # API hourly stats
     api_stats = db.execute("""
         SELECT
             CAST(ts / 3600 AS INTEGER) * 3600 as hour_ts,
@@ -127,7 +205,7 @@ def generate_data_json():
         ORDER BY hour_ts ASC
     """).fetchall()
 
-    # Overall key usage summary
+    # Key summary
     key_summary = db.execute("""
         SELECT key_name,
             COUNT(*) as calls,
@@ -140,17 +218,18 @@ def generate_data_json():
 
     db.close()
 
-    # Build anomalies with enriched detail
+    # Price computation
+    sats_per_token, btc_price = compute_sats_per_token()
+
+    # Anomalies with detail
     anomalies = []
     for ts, sev, cat, title, detail_json in anom_rows:
         detail = {}
         if detail_json:
             try:
                 detail = json.loads(detail_json)
-            except:
+            except Exception:
                 detail = {"raw": detail_json}
-
-        # Create human-readable explanation
         explanation = title
         if cat == "task_duration" and detail:
             task_id = detail.get("task_id", "?")
@@ -162,11 +241,8 @@ def generate_data_json():
             explanation = (
                 f"Worker '{profile}' (task {task_id[:12]}) took {elapsed:.0f}s "
                 f"vs expected {expected:.0f}s ({ratio:.1f}x slower). "
-                f"Baseline: {baseline}. "
-                f"This likely means the task hit an unexpected complication "
-                f"(build failure retry, network timeout, or large diff)."
+                f"Baseline: {baseline}."
             )
-
         anomalies.append({
             "ts": ts,
             "severity": sev,
@@ -176,29 +252,46 @@ def generate_data_json():
             "detail": detail,
         })
 
-    # Build hourly API data for chart
-    hour_times = sorted(set(r[0] for r in api_stats))
+    # Build hourly data - tokens AND SATs
     keys_present = sorted(set(r[1] for r in api_stats if r[1]))
-
     api_hourly = {k: {"times": [], "tokens": [], "calls": []} for k in keys_present}
+    sats_hourly = {k: {"times": [], "sats": [], "tokens": []} for k in keys_present}
+
     for hour_ts, key_name, calls, tokens, cache, success, avg_dur in api_stats:
         if key_name and key_name in api_hourly:
+            t = tokens or 0
             api_hourly[key_name]["times"].append(hour_ts * 1000)
-            api_hourly[key_name]["tokens"].append(tokens or 0)
+            api_hourly[key_name]["tokens"].append(t)
             api_hourly[key_name]["calls"].append(calls or 0)
+            sats_hourly[key_name]["times"].append(hour_ts * 1000)
+            sats_hourly[key_name]["sats"].append(t * sats_per_token.get(key_name, 0))
+            sats_hourly[key_name]["tokens"].append(t)
 
-    # Key summary
+    # Key summary with SATs
     key_summaries = []
     for key_name, calls, tokens, cache, success in key_summary:
         if not key_name:
             continue
+        t = tokens or 0
+        cost_sats = t * sats_per_token.get(key_name, 0)
         key_summaries.append({
             "key": key_name,
             "calls": calls,
-            "tokens_millions": round((tokens or 0) / 1_000_000, 1),
+            "tokens_millions": round(t / 1_000_000, 1),
             "cache_hits": cache or 0,
             "success_rate": round((success or 0) / calls * 100, 1) if calls else 0,
+            "cost_sats": round(cost_sats, 0),
+            "cost_sats_fmt": format_sats(cost_sats),
         })
+
+    price_info = {
+        "btc_eur": btc_price.get("eur", 0),
+        "btc_usd": btc_price.get("usd", 0),
+        "zai_sats_per_token": sats_per_token.get("ours", 0),
+        "zai_sats_per_Mtokens": round(sats_per_token.get("ours", 0) * 1_000_000, 4),
+        "ppq_sats_per_token": sats_per_token.get("ppq", 0),
+        "ppq_sats_per_Mtokens": round(sats_per_token.get("ppq", 0) * 1_000_000, 4),
+    }
 
     data = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -213,7 +306,9 @@ def generate_data_json():
         "anomalies": anomalies,
         "key_transitions": transitions,
         "api_hourly": api_hourly,
+        "api_hourly_sats": sats_hourly,
         "key_summaries": key_summaries,
+        "price_info": price_info,
     }
 
     with open(OUT_JSON, "w") as f:
@@ -222,7 +317,7 @@ def generate_data_json():
 
 
 def generate_html():
-    """Generate dashboard HTML with all enhancements."""
+    """Generate dashboard HTML with SATs pricing and log-scale chart c3."""
     html = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -265,7 +360,7 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 <body>
 
 <h1><span class="live"></span>Kalman Filter Monitor v3</h1>
-<p class="note">Enhanced: log-scale plots, API key switching, descriptive anomalies. Auto-refreshes every 2 min.</p>
+<p class="note">Enhanced: SATs burned per hour, log-scale plots, API key switching, descriptive anomalies. Auto-refreshes every 2 min.</p>
 
 <div id="loading">Loading data.json...</div>
 <div id="content" style="display:none">
@@ -279,22 +374,22 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
   <div class="card"><h3>Key Switches</h3><div class="v" id="switchCount" style="color:#f0a050">...</div><div class="note">total transitions</div></div>
 </div>
 
-<h2>Burn Rate (all samples) <span class="note">— tokens per hour over time</span></h2>
+<h2>Burn Rate (all samples) <span class="note"> tokens per hour over time</span></h2>
 <div class="chart" id="c1"></div>
 
 <h2>Predicted vs Actual Usage <button class="toggle" id="logToggle" onclick="toggleLog()">Linear</button></h2>
 <div class="chart" id="c2"></div>
 
-<h2>API Key Usage Timeline <span class="note">— tokens per hour by key (last 7 days)</span></h2>
+<h2>SATs Burned by Key <button class="toggle" id="c3LogToggle" onclick="toggleC3Log()">Log Scale</button> <span class="note"> SATs per hour (last 7 days)</span></h2>
 <div class="chart" id="c3"></div>
 
-<h2>Key Switching Log <span class="note">— when and why we switched API keys</span></h2>
+<h2>Key Switching Log <span class="note"> when and why we switched API keys</span></h2>
 <div id="switchLog"></div>
 
 <h2>Token Cost Summary by Key</h2>
 <div id="keySummary"></div>
 
-<h2>Recent Anomalies <span class="note">— with detailed explanations</span></h2>
+<h2>Recent Anomalies <span class="note"> with detailed explanations</span></h2>
 <div id="anomContainer"></div>
 
 </div>
@@ -307,6 +402,7 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 const dark = {paper_bgcolor:'#161b22',plot_bgcolor:'#0d1117',font:{color:'#c9d1d9',size:10},margin:{t:30,b:35,l:50,r:15}};
 const ax = {gridcolor:'#30363d'};
 var logScale = false;
+var c3LogScale = false;
 var chartsReady = false;
 var currentData = null;
 
@@ -325,6 +421,20 @@ function toggleLog() {
     btn.textContent = logScale ? 'Logarithmic' : 'Linear';
     btn.classList.toggle('active', logScale);
     if (currentData) renderCharts(currentData);
+}
+
+function toggleC3Log() {
+    c3LogScale = !c3LogScale;
+    var btn = document.getElementById('c3LogToggle');
+    btn.textContent = c3LogScale ? 'Linear' : 'Log Scale';
+    btn.classList.toggle('active', c3LogScale);
+    if (currentData) renderCharts(currentData);
+}
+
+function formatSats(n) {
+    if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+    return n.toFixed(1);
 }
 
 function renderCharts(data) {
@@ -347,7 +457,6 @@ function renderCharts(data) {
     var projTrace = {x:ts, y:proj, mode:'lines', name:'Predicted %', line:{color:'#58a6ff'}};
     var usedTrace = {x:ts, y:used, mode:'markers', marker:{size:2,color:'#d29922'}, name:'Observed %'};
 
-    // Add key transition markers as shapes
     var shapes = [];
     if (data.key_transitions) {
         for (var t of data.key_transitions) {
@@ -368,32 +477,48 @@ function renderCharts(data) {
     Plotly.react('c2',[projTrace,usedTrace],
         {...dark,title:'Predicted vs Actual' + (logScale?' (log scale)':''),xaxis:ax,yaxis:yConfig,shapes:shapes},{responsive:true});
 
-    // Chart 3: API Key Usage Timeline
-    if (data.api_hourly) {
+    // Chart 3: API Cost Timeline  SATs burned per hour by key
+    var satsData = data.api_hourly_sats;
+    if (satsData) {
         var traces = [];
         var keyColors = {ours:'#58a6ff', friend:'#f0a050', ppq:'#bb86fc', None:'#888'};
-        for (var key in data.api_hourly) {
-            var kd = data.api_hourly[key];
+
+        var hasPpq = false;
+        for (var key in satsData) {
+            if (key === 'ppq' && satsData[key].sats.some(s => s > 0)) hasPpq = true;
+        }
+
+        for (var key in satsData) {
+            var kd = satsData[key];
             if (kd.times.length === 0) continue;
+
+            var xVals = [];
+            var yVals = [];
+            for (var i = 0; i < kd.times.length; i++) {
+                xVals.push(new Date(kd.times[i]));
+                yVals.push(kd.sats[i] > 0 ? kd.sats[i] : null);
+            }
+
             traces.push({
-                x: kd.times.map(t => new Date(t)),
-                y: kd.tokens.map(t => t/1000000),
-                stackgroup: 'one',
+                x: xVals,
+                y: yVals,
+                mode: 'lines+markers',
                 name: key,
-                line: {color: keyColors[key] || '#888', width:0.5},
-                fill: 'tonexty',
+                line: {color: keyColors[key] || '#888', width: 1.5},
+                marker: {size: 3, color: keyColors[key] || '#888'},
             });
         }
+
         if (traces.length === 0) {
             traces.push({x:[], y:[], type:'scatter', name:'No data'});
         }
-        // Fix first trace (no stacking reference)
-        if (traces.length > 0) delete traces[0].fill;
+
+        var c3yConfig = {...ax, title:'SATs/hr', type: c3LogScale ? 'log' : 'linear', autorange: true};
 
         Plotly.react('c3', traces,
-            {...dark, title:'Token Usage by Key (millions/hour)',
-             xaxis:ax,
-             yaxis:{...ax,title:'M tokens/hr',stackgroup:'one'}},
+            {...dark, title:'API Cost by Key (SATs/hr)'
+                + (hasPpq ? '  PPQ included' : ''),
+             xaxis:ax, yaxis:c3yConfig},
             {responsive:true});
     }
 }
@@ -403,11 +528,10 @@ function renderSwitchLog(data) {
         document.getElementById('switchLog').innerHTML = '<p class="note">No key switches recorded.</p>';
         return;
     }
-
     var html = '';
     var transitions = data.key_transitions.slice(-30).reverse();
     for (var t of transitions) {
-        var arrow = t.from ? '<span class="from">' + t.from + '</span> → <span class="to">' + t.to + '</span>' : '→ <span class="to">' + t.to + '</span> (initial)';
+        var arrow = t.from ? '<span class="from">' + t.from + '</span>  <span class="to">' + t.to + '</span>' : ' <span class="to">' + t.to + '</span> (initial)';
         html += '<div class="kpilog">';
         html += '<div style="display:flex;justify-content:space-between;align-items:center;">';
         html += '<span><span class="arrow">' + arrow + '</span></span>';
@@ -428,12 +552,22 @@ function renderKeySummary(data) {
         document.getElementById('keySummary').innerHTML = '<p class="note">No API call data.</p>';
         return;
     }
-    var html = '<table><tr><th>Key</th><th>Calls</th><th>Tokens (M)</th><th>Cache Hits</th><th>Success Rate</th></tr>';
+    var priceNote = '';
+    if (data.price_info) {
+        var p = data.price_info;
+        priceNote = '<div class="note" style="margin-bottom:8px;">'
+            + 'z.ai: ' + p.zai_sats_per_Mtokens + ' sats/Mtok | '
+            + 'PPQ: ' + p.ppq_sats_per_Mtokens + ' sats/Mtok | '
+            + 'BTC: ' + p.btc_eur + ' / $' + p.btc_usd
+            + '</div>';
+    }
+    var html = priceNote
+        + '<table><tr><th>Key</th><th>Calls</th><th>Tokens (M)</th><th>Cost (SATs)</th><th>Success Rate</th></tr>';
     for (var k of data.key_summaries) {
         html += '<tr><td>' + keyBadge(k.key) + '</td>';
         html += '<td>' + k.calls.toLocaleString() + '</td>';
         html += '<td>' + k.tokens_millions + 'M</td>';
-        html += '<td>' + k.cache_hits + '</td>';
+        html += '<td>' + (k.cost_sats_fmt || k.cost_sats || '') + '</td>';
         html += '<td>' + k.success_rate + '%</td></tr>';
     }
     html += '</table>';
@@ -463,22 +597,17 @@ function renderAnomalies(data) {
 
 function render(data) {
     currentData = data;
-
-    // Update cards
     const lastIdx = data.burn_rate.length - 1;
-    document.getElementById('burnRate').textContent = data.burn_rate[lastIdx] ? (data.burn_rate[lastIdx]/1000).toFixed(1)+'k' : '—';
-    document.getElementById('projTotal').textContent = data.projected_pct[lastIdx] ? data.projected_pct[lastIdx].toFixed(1)+'%' : '—';
+    document.getElementById('burnRate').textContent = data.burn_rate[lastIdx] ? (data.burn_rate[lastIdx]/1000).toFixed(1)+'k' : '';
+    document.getElementById('projTotal').textContent = data.projected_pct[lastIdx] ? data.projected_pct[lastIdx].toFixed(1)+'%' : '';
     const exhaustVal = data.exhausts_in_hours[lastIdx];
     document.getElementById('exhaust').textContent = exhaustVal ? exhaustVal.toFixed(1)+'h' : 'safe';
     document.getElementById('exhaust').style.color = data.will_exhaust[lastIdx] ? '#f85149' : '#7ee787';
     document.getElementById('pointCount').textContent = data.sample_count.toLocaleString();
-
-    // Active key from last transition
     if (data.key_transitions && data.key_transitions.length > 0) {
         var lastT = data.key_transitions[data.key_transitions.length - 1];
         document.getElementById('activeKey').innerHTML = keyBadge(lastT.to);
     }
-
     renderCharts(data);
     renderSwitchLog(data);
     renderKeySummary(data);
