@@ -110,6 +110,8 @@ def compute_sats_per_token():
         result["friend"] = 0
 
     # PPQ price - from balance_snapshots
+    # Try balance_snapshots for real balance data
+    usd_per_token = 0.50 / 1_000_000  # default fallback: 50/M
     try:
         bdb = sqlite3.connect(str(BURN_DB))
         ppq_rows = bdb.execute("""
@@ -126,11 +128,10 @@ def compute_sats_per_token():
                 WHERE ppq_hit=1 AND ts BETWEEN ? AND ?
             """, (previous[0], latest[0])).fetchone()[0] or 1
             usd_spent = previous[1] - latest[1]
-            usd_per_token = usd_spent / ppq_tokens if usd_spent > 0 else 0
-        else:
-            usd_per_token = 0.50 / 1_000_000  # fallback: 50/M
+            if usd_spent > 0 and ppq_tokens > 1:
+                usd_per_token = usd_spent / ppq_tokens
     except Exception:
-        usd_per_token = 0
+        pass
 
     if btc["usd"] > 0 and usd_per_token > 0:
         result["ppq"] = (usd_per_token / btc["usd"]) * 100_000_000
