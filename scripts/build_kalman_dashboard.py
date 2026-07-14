@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 DB = os.path.expanduser("~/.hermes/bot/zai_usage.db")
 POOL = os.path.expanduser("~/.hermes/state/pool_kalman.json")
 OUT = os.path.expanduser("~/nsites/kalman-data/index.html")
-NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+NSEC_PUBKEY = "d5c85ab43517b35d374a6360fa58fdc5f807b5331b3df7b155f34290acbb922b"
 
 # Extract historical data for initial render
 db = sqlite3.connect(DB)

@@ -15,7 +15,7 @@ from pathlib import Path
 DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
 OUT_HTML = Path.home() / "nsites" / "kalman-data" / "index.html"
 OUT_JSON = Path.home() / "nsites" / "kalman-data" / "data.json"
-NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
+NSEC_PUBKEY = "d5c85ab43517b35d374a6360fa58fdc5f807b5331b3df7b155f34290acbb922b"
 
 
 def generate_data_json():
