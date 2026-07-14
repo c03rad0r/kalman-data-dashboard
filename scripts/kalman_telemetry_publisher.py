@@ -30,7 +30,10 @@ from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────
 
-NSEC = os.environ.get("KALMAN_NSEC", "REDACTED_NSEC_ROTATED")
+NSEC = os.environ.get("KALMAN_NSEC", "")
+if not NSEC:
+    print("WARNING: KALMAN_NSEC env var not set — telemetry publishing disabled")
+    sys.exit(0)
 RELAYS = ["wss://relay.ngit.dev", "wss://nos.lol"]
 DB_PATH = os.path.expanduser("~/.hermes/bot/zai_usage.db")
 POOL_PATH = os.path.expanduser("~/.hermes/state/pool_kalman.json")

@@ -35,12 +35,13 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 .kpi-friend{background:#3d2a1a;color:#f0a050;}
 .kpi-ppq{background:#2a1a3d;color:#bb86fc;}
 .kpi-none{background:#333;color:#888;}
+.kpi-ollama{background:#1a3a3a;color:#4ec9b0;}
 </style>
 </head>
 <body>
 
 <h1><span class="live"></span>Kalman Filter Monitor v3</h1>
-<p class="note">Enhanced: log-scale plots, API key switching, descriptive anomalies. Auto-refreshes every 2 min.</p>
+<p class="note">Enhanced: SATs burned per hour, log-scale plots, API key switching, descriptive anomalies. Auto-refreshes every 2 min.</p>
 
 <div id="loading">Loading data.json...</div>
 <div id="content" style="display:none">
@@ -54,23 +55,40 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
   <div class="card"><h3>Key Switches</h3><div class="v" id="switchCount" style="color:#f0a050">...</div><div class="note">total transitions</div></div>
 </div>
 
-<h2>Burn Rate (all samples) <span class="note">— tokens per hour over time</span></h2>
+<h2>Burn Rate (all samples) <span class="note"> tokens per hour over time</span></h2>
 <div class="chart" id="c1"></div>
 
 <h2>Predicted vs Actual Usage <button class="toggle" id="logToggle" onclick="toggleLog()">Linear</button></h2>
 <div class="chart" id="c2"></div>
 
-<h2>API Key Usage Timeline <span class="note">— tokens per hour by key (last 7 days)</span></h2>
+<h2>SATs Burned by Key <button class="toggle" id="c3LogToggle" onclick="toggleC3Log()">Log Scale</button> <span class="note"> SATs per hour (last 7 days)</span></h2>
 <div class="chart" id="c3"></div>
 
-<h2>Key Switching Log <span class="note">— when and why we switched API keys</span></h2>
+<h2>Key Switching Log <span class="note"> when and why we switched API keys</span></h2>
 <div id="switchLog"></div>
 
 <h2>Token Cost Summary by Key</h2>
 <div id="keySummary"></div>
 
-<h2>Recent Anomalies <span class="note">— with detailed explanations</span></h2>
+<h2>Recent Anomalies <span class="note"> with detailed explanations</span></h2>
 <div id="anomContainer"></div>
+
+<h2>Business KPI Cards <span class="note"> SATs/task cost and efficiency metrics</span></h2>
+<div class="grid">
+  <div class="card"><h3>SATs/Task Cost</h3><div class="v" id="satsPerTask" style="color:#58a6ff">...</div><div class="note">current rate</div></div>
+  <div class="card"><h3>Crash-Free Rate</h3><div class="v" id="crashFreeRate" style="color:#7ee787">...</div><div class="note">task completion %</div></div>
+  <div class="card"><h3>Resource Efficiency</h3><div class="v" id="resourceEfficiency" style="color:#f0a050">...</div><div class="note">avg utilization</div></div>
+  <div class="card"><h3>Cost Trend</h3><div class="v" id="costTrend" style="color:#bb86fc">...</div><div class="note">7-day change</div></div>
+</div>
+
+<h2>Cost Efficiency Chart <button class="toggle" id="costLogToggle" onclick="toggleCostLog()">Log Scale</button> <span class="note"> SATs burned vs tasks completed</span></h2>
+<div class="chart" id="costChart"></div>
+
+<h2>Crash Impact Analysis <span class="note"> crashes overlaid on business metrics</span></h2>
+<div class="chart" id="crashChart"></div>
+
+<h2>Resource Cost Analysis <span class="note"> Memory/CPU usage vs business value</span></h2>
+<div class="chart" id="resourceChart"></div>
 
 </div>
 
@@ -82,6 +100,8 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 const dark = {paper_bgcolor:'#161b22',plot_bgcolor:'#0d1117',font:{color:'#c9d1d9',size:10},margin:{t:30,b:35,l:50,r:15}};
 const ax = {gridcolor:'#30363d'};
 var logScale = false;
+var c3LogScale = false;
+var costLogScale = false;
 var chartsReady = false;
 var currentData = null;
 
@@ -102,6 +122,28 @@ function toggleLog() {
     if (currentData) renderCharts(currentData);
 }
 
+function toggleC3Log() {
+    c3LogScale = !c3LogScale;
+    var btn = document.getElementById('c3LogToggle');
+    btn.textContent = c3LogScale ? 'Linear' : 'Log Scale';
+    btn.classList.toggle('active', c3LogScale);
+    if (currentData) renderCharts(currentData);
+}
+
+function toggleCostLog() {
+    costLogScale = !costLogScale;
+    var btn = document.getElementById('costLogToggle');
+    btn.textContent = costLogScale ? 'Linear' : 'Log Scale';
+    btn.classList.toggle('active', costLogScale);
+    if (currentData) renderBusinessCharts(currentData);
+}
+
+function formatSats(n) {
+    if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+    return n.toFixed(1);
+}
+
 function renderCharts(data) {
     const ts = data.times.map(t => new Date(t));
     const burn = data.burn_rate;
@@ -119,10 +161,9 @@ function renderCharts(data) {
         yConfig.type = 'log';
         yConfig.autorange = true;
     }
-    var projTrace = {x:ts, y:proj, mode:'lines', name:'Predicted %', line:{color:'#58a6ff'}};
+    var projTrace = {x:ts, y:proj, mode:'markers', name:'Predicted %', marker:{size:4,color:'#58a6ff'}};
     var usedTrace = {x:ts, y:used, mode:'markers', marker:{size:2,color:'#d29922'}, name:'Observed %'};
 
-    // Add key transition markers as shapes
     var shapes = [];
     if (data.key_transitions) {
         for (var t of data.key_transitions) {
@@ -143,32 +184,50 @@ function renderCharts(data) {
     Plotly.react('c2',[projTrace,usedTrace],
         {...dark,title:'Predicted vs Actual' + (logScale?' (log scale)':''),xaxis:ax,yaxis:yConfig,shapes:shapes},{responsive:true});
 
-    // Chart 3: API Key Usage Timeline
-    if (data.api_hourly) {
+    // Chart 3: API Cost Timeline  SATs burned per hour by key
+    var satsData = data.api_hourly_sats;
+    if (satsData) {
         var traces = [];
-        var keyColors = {ours:'#58a6ff', friend:'#f0a050', ppq:'#bb86fc', None:'#888'};
-        for (var key in data.api_hourly) {
-            var kd = data.api_hourly[key];
+        var keyColors = {ours:'#58a6ff', friend:'#f0a050', ppq:'#bb86fc', ollama:'#4ec9b0', None:'#888'};
+
+        var hasPpq = false;
+        var hasOllama = false;
+        for (var key in satsData) {
+            if (key === 'ppq' && satsData[key].sats.some(s => s > 0)) hasPpq = true;
+            if (key === 'ollama' && satsData[key].sats.some(s => s > 0)) hasOllama = true;
+        }
+
+        for (var key in satsData) {
+            var kd = satsData[key];
             if (kd.times.length === 0) continue;
+
+            var xVals = [];
+            var yVals = [];
+            for (var i = 0; i < kd.times.length; i++) {
+                xVals.push(new Date(kd.times[i]));
+                yVals.push(kd.sats[i] > 0 ? kd.sats[i] : null);
+            }
+
             traces.push({
-                x: kd.times.map(t => new Date(t)),
-                y: kd.tokens.map(t => t/1000000),
-                stackgroup: 'one',
+                x: xVals,
+                y: yVals,
+                mode: 'markers',
                 name: key,
-                line: {color: keyColors[key] || '#888', width:0.5},
-                fill: 'tonexty',
+                marker: {size: 4, color: keyColors[key] || '#888'},
             });
         }
+
         if (traces.length === 0) {
             traces.push({x:[], y:[], type:'scatter', name:'No data'});
         }
-        // Fix first trace (no stacking reference)
-        if (traces.length > 0) delete traces[0].fill;
+
+        var c3yConfig = {...ax, title:'SATs/hr', type: c3LogScale ? 'log' : 'linear', autorange: true};
 
         Plotly.react('c3', traces,
-            {...dark, title:'Token Usage by Key (millions/hour)',
-             xaxis:ax,
-             yaxis:{...ax,title:'M tokens/hr',stackgroup:'one'}},
+            {...dark, title:'API Cost by Key (SATs/hr)'
+                + (hasPpq ? '  PPQ included' : '')
+                + (hasOllama ? '  Ollama included' : ''),
+             xaxis:ax, yaxis:c3yConfig},
             {responsive:true});
     }
 }
@@ -178,11 +237,10 @@ function renderSwitchLog(data) {
         document.getElementById('switchLog').innerHTML = '<p class="note">No key switches recorded.</p>';
         return;
     }
-
     var html = '';
     var transitions = data.key_transitions.slice(-30).reverse();
     for (var t of transitions) {
-        var arrow = t.from ? '<span class="from">' + t.from + '</span> → <span class="to">' + t.to + '</span>' : '→ <span class="to">' + t.to + '</span> (initial)';
+        var arrow = t.from ? '<span class="from">' + t.from + '</span>  <span class="to">' + t.to + '</span>' : ' <span class="to">' + t.to + '</span> (initial)';
         html += '<div class="kpilog">';
         html += '<div style="display:flex;justify-content:space-between;align-items:center;">';
         html += '<span><span class="arrow">' + arrow + '</span></span>';
@@ -203,12 +261,22 @@ function renderKeySummary(data) {
         document.getElementById('keySummary').innerHTML = '<p class="note">No API call data.</p>';
         return;
     }
-    var html = '<table><tr><th>Key</th><th>Calls</th><th>Tokens (M)</th><th>Cache Hits</th><th>Success Rate</th></tr>';
+    var priceNote = '';
+    if (data.price_info) {
+        var p = data.price_info;
+        priceNote = '<div class="note" style="margin-bottom:8px;">'
+            + 'z.ai: ' + p.zai_sats_per_Mtokens + ' sats/Mtok | '
+            + 'PPQ: ' + p.ppq_sats_per_Mtokens + ' sats/Mtok | '
+            + 'BTC: ' + p.btc_eur + ' / $' + p.btc_usd
+            + '</div>';
+    }
+    var html = priceNote
+        + '<table><tr><th>Key</th><th>Calls</th><th>Tokens (M)</th><th>Cost (SATs)</th><th>Success Rate</th></tr>';
     for (var k of data.key_summaries) {
         html += '<tr><td>' + keyBadge(k.key) + '</td>';
         html += '<td>' + k.calls.toLocaleString() + '</td>';
         html += '<td>' + k.tokens_millions + 'M</td>';
-        html += '<td>' + k.cache_hits + '</td>';
+        html += '<td>' + (k.cost_sats_fmt || k.cost_sats || '') + '</td>';
         html += '<td>' + k.success_rate + '%</td></tr>';
     }
     html += '</table>';
@@ -236,28 +304,196 @@ function renderAnomalies(data) {
     document.getElementById('anomContainer').innerHTML = html;
 }
 
+function renderBusinessKPIs(data) {
+    if (!data.business_metrics) return;
+    
+    var bm = data.business_metrics;
+    var currentSatsPerTask = 0;
+    var currentCrashFreeRate = 100;
+    var currentResourceEfficiency = 0;
+    var costTrend = 0;
+    
+    // Calculate current KPI values
+    if (bm.sats_per_task && bm.sats_per_task.length > 0) {
+        var latest = bm.sats_per_task[bm.sats_per_task.length - 1];
+        var oldest = bm.sats_per_task[0];
+        currentSatsPerTask = latest.value || 0;
+        costTrend = oldest.value > 0 ? ((latest.value - oldest.value) / oldest.value * 100) : 0;
+    }
+    
+    if (bm.cost_efficiency && bm.cost_efficiency.length > 0) {
+        var latest = bm.cost_efficiency[bm.cost_efficiency.length - 1];
+        currentCrashFreeRate = latest.crash_free_rate || 100;
+    }
+    
+    if (bm.resource_efficiency && bm.resource_efficiency.length > 0) {
+        var latest = bm.resource_efficiency[bm.resource_efficiency.length - 1];
+        currentResourceEfficiency = Math.round((latest.cpu_efficiency + latest.memory_efficiency) / 2);
+    }
+    
+    document.getElementById('satsPerTask').textContent = formatSats(currentSatsPerTask);
+    document.getElementById('crashFreeRate').textContent = currentCrashFreeRate.toFixed(1) + '%';
+    document.getElementById('resourceEfficiency').textContent = currentResourceEfficiency + '%';
+    
+    var trendElement = document.getElementById('costTrend');
+    if (costTrend > 0) {
+        trendElement.textContent = '+' + costTrend.toFixed(1) + '%';
+        trendElement.style.color = '#f85149';
+    } else if (costTrend < 0) {
+        trendElement.textContent = costTrend.toFixed(1) + '%';
+        trendElement.style.color = '#7ee787';
+    } else {
+        trendElement.textContent = '0.0%';
+        trendElement.style.color = '#f0a050';
+    }
+}
+
+function renderBusinessCharts(data) {
+    if (!data.business_metrics) return;
+    
+    var bm = data.business_metrics;
+    
+    // Cost Efficiency Chart - SATs burned vs tasks completed
+    if (bm.cost_efficiency && bm.cost_efficiency.length > 0) {
+        var times = [];
+        var satsBurned = [];
+        var tasksCompleted = [];
+        
+        for (var i = 0; i < bm.cost_efficiency.length; i++) {
+            var item = bm.cost_efficiency[i];
+            times.push(new Date(item.ts * 1000));
+            satsBurned.push(item.sats_burned);
+            tasksCompleted.push(item.tasks_completed);
+        }
+        
+        var satsTrace = {
+            x: times,
+            y: satsBurned,
+            type: 'bar',
+            name: 'SATs Burned',
+            yaxis: 'y',
+            marker: {color: '#58a6ff'}
+        };
+        
+        var tasksTrace = {
+            x: times,
+            y: tasksCompleted,
+            type: 'scatter',
+            mode: 'markers',
+            name: 'Tasks Completed',
+            yaxis: 'y2',
+            marker: {color: '#7ee787', size: 4}
+        };
+        
+        var yConfig = {...ax, title: 'SATs', type: costLogScale ? 'log' : 'linear', autorange: true};
+        
+        Plotly.react('costChart', [satsTrace, tasksTrace],
+            {...dark, title: 'SATs Burned vs Tasks Completed',
+             xaxis: {...ax, title: 'Time'},
+             yaxis: yConfig,
+             yaxis2: {...ax, title: 'Tasks', side: 'right', overlaying: 'y'}},
+            {responsive: true});
+    }
+    
+    // Crash Impact Analysis
+    if (bm.crash_events && bm.crash_events.length > 0) {
+        var times = [];
+        var crashes = [];
+        var tasks = [];
+        
+        for (var i = 0; i < bm.crash_events.length; i++) {
+            var item = bm.crash_events[i];
+            times.push(new Date(item.ts * 1000));
+            crashes.push(item.crashes);
+            
+            // Find corresponding tasks for this hour
+            var taskData = bm.tasks_completed.find(t => t.ts === item.ts);
+            tasks.push(taskData ? taskData.value : 0);
+        }
+        
+        var crashTrace = {
+            x: times,
+            y: crashes,
+            type: 'bar',
+            name: 'Crashes',
+            yaxis: 'y',
+            marker: {color: '#f85149'}
+        };
+        
+        var taskTrace = {
+            x: times,
+            y: tasks,
+            type: 'scatter',
+            mode: 'markers',
+            name: 'Tasks Completed',
+            yaxis: 'y2',
+            marker: {color: '#7ee787', size: 4}
+        };
+        
+        Plotly.react('crashChart', [crashTrace, taskTrace],
+            {...dark, title: 'Crash Impact on Task Completion',
+             xaxis: {...ax, title: 'Time'},
+             yaxis: {...ax, title: 'Crashes'},
+             yaxis2: {...ax, title: 'Tasks', side: 'right', overlaying: 'y'}},
+            {responsive: true});
+    }
+    
+    // Resource Cost Analysis
+    if (bm.resource_efficiency && bm.resource_efficiency.length > 0) {
+        var times = [];
+        var cpuEff = [];
+        var memEff = [];
+        
+        for (var i = 0; i < bm.resource_efficiency.length; i++) {
+            var item = bm.resource_efficiency[i];
+            times.push(new Date(item.ts * 1000));
+            cpuEff.push(item.cpu_efficiency);
+            memEff.push(item.memory_efficiency);
+        }
+        
+        var cpuTrace = {
+            x: times,
+            y: cpuEff,
+            mode: 'markers',
+            name: 'CPU Efficiency',
+            marker: {color: '#58a6ff', size: 4}
+        };
+        
+        var memTrace = {
+            x: times,
+            y: memEff,
+            mode: 'markers',
+            name: 'Memory Efficiency',
+            marker: {color: '#f0a050', size: 4}
+        };
+        
+        Plotly.react('resourceChart', [cpuTrace, memTrace],
+            {...dark, title: 'Resource Efficiency vs Business Value',
+             xaxis: ax,
+             yaxis: {...ax, title: 'Efficiency (%)'}},
+            {responsive: true});
+    }
+}
+
 function render(data) {
     currentData = data;
-
-    // Update cards
     const lastIdx = data.burn_rate.length - 1;
-    document.getElementById('burnRate').textContent = data.burn_rate[lastIdx] ? (data.burn_rate[lastIdx]/1000).toFixed(1)+'k' : '—';
-    document.getElementById('projTotal').textContent = data.projected_pct[lastIdx] ? data.projected_pct[lastIdx].toFixed(1)+'%' : '—';
+    document.getElementById('burnRate').textContent = data.burn_rate[lastIdx] ? (data.burn_rate[lastIdx]/1000).toFixed(1)+'k' : '';
+    document.getElementById('projTotal').textContent = data.projected_pct[lastIdx] ? data.projected_pct[lastIdx].toFixed(1)+'%' : '';
     const exhaustVal = data.exhausts_in_hours[lastIdx];
     document.getElementById('exhaust').textContent = exhaustVal ? exhaustVal.toFixed(1)+'h' : 'safe';
     document.getElementById('exhaust').style.color = data.will_exhaust[lastIdx] ? '#f85149' : '#7ee787';
     document.getElementById('pointCount').textContent = data.sample_count.toLocaleString();
-
-    // Active key from last transition
     if (data.key_transitions && data.key_transitions.length > 0) {
         var lastT = data.key_transitions[data.key_transitions.length - 1];
         document.getElementById('activeKey').innerHTML = keyBadge(lastT.to);
     }
-
     renderCharts(data);
     renderSwitchLog(data);
     renderKeySummary(data);
     renderAnomalies(data);
+    renderBusinessKPIs(data);
+    renderBusinessCharts(data);
     chartsReady = true;
 }
 

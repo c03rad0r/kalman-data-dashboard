@@ -12,6 +12,7 @@ v3.1 improvements:
 import sqlite3, json, os, re, urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 DB = Path.home() / ".hermes" / "bot" / "zai_usage.db"
 BURN_DB = Path.home() / ".hermes" / "bot" / "api_burn.db"
@@ -20,7 +21,10 @@ OUT_JSON = Path.home() / "nsites" / "kalman-data" / "data.json"
 NSEC_PUBKEY = "29296138c53d33b2ff055198db8fcd883214ac141b2a0a4473fc87510b0eec1d"
 
 # Price config
-ZAI_MONTHLY_EUR = 144.0
+ZAI_MONTHLY_EUR = 144.0  # Our key: monthly subscription
+ZAI_FRIEND_YEARLY_EUR = 200.0  # Friend key: yearly subscription (€0.548/day)
+ZAI_FRIEND_DAILY_EUR = ZAI_FRIEND_YEARLY_EUR / 365.25
+ZAI_OURS_DAILY_EUR = ZAI_MONTHLY_EUR / 30.0
 BTCOINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=eur,usd"
 
 
@@ -84,8 +88,10 @@ def fetch_btc_price():
 def compute_sats_per_token():
     """Compute SATs-per-token for z.ai and PPQ.
 
-    z.ai: 144/mo flat rate  30-day token burn = /token  SATs via BTC/EUR
-    PPQ:  balance_snapshots (USD spent / tokens used)  SATs via BTC/USD
+    z.ai: Dual pricing - flat daily cost + per-token equivalent
+        ours: €144/month = €4.80/day
+        friend: €200/year = €0.548/day
+    PPQ: balance_snapshots (USD spent / tokens used)  SATs via BTC/USD
     """
     btc = fetch_btc_price()
     result = {"ours": 0, "friend": 0, "ppq": 0}
@@ -93,48 +99,74 @@ def compute_sats_per_token():
     db = sqlite3.connect(str(DB))
     cutoff_30d = datetime.now(timezone.utc).timestamp() - 86400 * 30
 
-    # z.ai price
-    row = db.execute("""
+    # z.ai price - separate for ours and friend keys
+    # Get tokens for each key separately
+    ours_row = db.execute("""
         SELECT SUM(total_tokens)
         FROM api_calls
         WHERE ts > ? AND ppq_hit = 0 AND status_code = 200
-          AND key_name IN ('ours','friend')
+          AND key_name = 'ours'
     """, (cutoff_30d,)).fetchone()
-    monthly_tokens = row[0] or 1
-    eur_per_token = ZAI_MONTHLY_EUR / monthly_tokens
-    if btc["eur"] > 0:
-        result["ours"] = (eur_per_token / btc["eur"]) * 100_000_000
-        result["friend"] = result["ours"]
-    else:
-        result["ours"] = 0
-        result["friend"] = 0
+    ours_monthly_tokens = ours_row[0] or 1
 
-    # PPQ price - from balance_snapshots
-    # Try balance_snapshots for real balance data
-    usd_per_token = 0.50 / 1_000_000  # default fallback: 50/M
-    try:
-        bdb = sqlite3.connect(str(BURN_DB))
-        ppq_rows = bdb.execute("""
-            SELECT ts, balance_usd FROM balance_snapshots
-            WHERE provider='ppq' AND balance_usd IS NOT NULL AND error IS NULL
-            ORDER BY ts DESC LIMIT 2
-        """).fetchall()
-        bdb.close()
-        if len(ppq_rows) >= 2:
-            latest = ppq_rows[0]
-            previous = ppq_rows[1]
-            ppq_tokens = db.execute("""
-                SELECT SUM(total_tokens) FROM api_calls
-                WHERE ppq_hit=1 AND ts BETWEEN ? AND ?
-            """, (previous[0], latest[0])).fetchone()[0] or 1
-            usd_spent = previous[1] - latest[1]
-            if usd_spent > 0 and ppq_tokens > 1:
-                usd_per_token = usd_spent / ppq_tokens
-    except Exception:
-        pass
+    friend_row = db.execute("""
+        SELECT SUM(total_tokens)
+        FROM api_calls
+        WHERE ts > ? AND ppq_hit = 0 AND status_code = 200
+          AND key_name = 'friend'
+    """, (cutoff_30d,)).fetchone()
+    friend_monthly_tokens = friend_row[0] or 1
+
+    if btc["eur"] > 0:
+        # Our key per-token rate: €144/month ÷ monthly tokens
+        ours_eur_per_token = ZAI_MONTHLY_EUR / ours_monthly_tokens
+        result["ours"] = (ours_eur_per_token / btc["eur"]) * 100_000_000
+
+        # Friend key per-token rate: €200/year ÷ monthly tokens × 12 (for yearly equiv)
+        friend_yearly_tokens = friend_monthly_tokens * 12
+        friend_eur_per_token = ZAI_FRIEND_YEARLY_EUR / friend_yearly_tokens
+        result["friend"] = (friend_eur_per_token / btc["eur"]) * 100_000_000
+
+    # PPQ price - from live PPQ API or api_calls data
+    # The ppq_logger.py cron imports query history including real USD spend
+    # Fallback: $1.20/M blended from known PPQ rates
+    usd_per_token = 1.20 / 1_000_000
+
+    # Try live PPQ API for real USD/token rate
+    ppq_key = os.environ.get("PPQ_API_KEY", "").strip()
+    if ppq_key:
+        try:
+            # Get real total_usage from balance endpoint
+            ppq_bal_req = urllib.request.Request(
+                "https://api.ppq.ai/credits/balance",
+                data=b'{}',
+                headers={"Authorization": f"Bearer {ppq_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(ppq_bal_req, timeout=10) as r:
+                ppq_bal = json.loads(r.read())
+            total_spent = float(ppq_bal.get("total_spent", 0))
+            if total_spent > 0:
+                total_tokens = db.execute("""
+                    SELECT SUM(total_tokens) FROM api_calls WHERE ppq_hit=1
+                """).fetchone()[0] or 1
+                if total_tokens > 100:
+                    usd_per_token = total_spent / total_tokens
+        except Exception:
+            pass
 
     if btc["usd"] > 0 and usd_per_token > 0:
         result["ppq"] = (usd_per_token / btc["usd"]) * 100_000_000
+
+    # Add flat daily costs in SATs
+    if btc["eur"] > 0:
+        # Our key: €4.80/day to SATs
+        result["ours_daily_flat_sats"] = (ZAI_OURS_DAILY_EUR / btc["eur"]) * 100_000_000
+        # Friend key: €0.548/day to SATs  
+        result["friend_daily_flat_sats"] = (ZAI_FRIEND_DAILY_EUR / btc["eur"]) * 100_000_000
+    else:
+        result["ours_daily_flat_sats"] = 0
+        result["friend_daily_flat_sats"] = 0
 
     db.close()
     return result, btc
@@ -149,6 +181,189 @@ def format_sats(n):
         return f"{n:.1f}"
     else:
         return f"{n:.4f}"
+
+
+def parse_timestamp(ts):
+    """Convert various timestamp formats to Unix timestamp (float)."""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    
+    if isinstance(ts, str):
+        # Try to parse SQLite TIMESTAMP format (YYYY-MM-DD HH:MM:SS)
+        try:
+            dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+        
+        # Try to parse with different formats
+        formats = [
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%dT%H:%M:%S',
+            '%Y-%m-%dT%H:%M:%SZ',
+            '%Y-%m-%dT%H:%M:%S.%f',
+        ]
+        
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(ts, fmt)
+                if fmt.endswith('Z'):
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                continue
+    
+    # If all else fails, return current time
+    return time.time()
+
+
+def get_business_metrics(db):
+    """Calculate business metrics: SATs/task, crash correlation, efficiency."""
+    # Task completion and SATs cost
+    task_rows = db.execute("""
+        SELECT ts, outcome, elapsed_sec, task_id, profile
+        FROM task_duration_samples
+        WHERE ts > (SELECT MAX(ts) - 86400*7 FROM task_duration_samples)
+        ORDER BY ts ASC
+    """).fetchall()
+    
+    # Crash events
+    crash_rows = db.execute("""
+        SELECT ts, crash_count, oom_count, rate_limit_count, api_error_count
+        FROM crash_events
+        WHERE ts > (SELECT MAX(ts) - 86400*7 FROM crash_events)
+        ORDER BY ts ASC
+    """).fetchall()
+    
+    # Resource metrics
+    resource_rows = db.execute("""
+        SELECT ts, cpu_load_5m, memory_used_percent, worker_count,
+               blocked_by_load, blocked_by_memory
+        FROM resource_metrics
+        WHERE ts > (SELECT MAX(ts) - 86400*7 FROM resource_metrics)
+        ORDER BY ts ASC
+    """).fetchall()
+    
+    # API calls for SATs calculation
+    api_hourly = db.execute("""
+        SELECT 
+            CAST(ts / 3600 AS INTEGER) * 3600 as hour_ts,
+            SUM(total_tokens) as tokens,
+            COUNT(*) as calls,
+            SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) as success_calls
+        FROM api_calls
+        WHERE ts > (SELECT MAX(ts) - 86400*7 FROM api_calls)
+        GROUP BY hour_ts
+        ORDER BY hour_ts ASC
+    """).fetchall()
+    
+    # Calculate business metrics
+    business_data = {
+        'tasks_completed': [],
+        'tasks_failed': [],
+        'crash_events': [],
+        'resource_efficiency': [],
+        'cost_efficiency': [],
+        'sats_per_task': []
+    }
+    
+    # Process tasks and calculate completion rates
+    hourly_tasks = {}
+    for ts, outcome, elapsed_sec, task_id, profile in task_rows:
+        hour = int(parse_timestamp(ts) // 3600) * 3600
+        if hour not in hourly_tasks:
+            hourly_tasks[hour] = {'completed': 0, 'failed': 0, 'total_time': 0}
+        
+        if outcome == 'completed':
+            hourly_tasks[hour]['completed'] += 1
+            hourly_tasks[hour]['total_time'] += float(elapsed_sec or 0)
+        else:
+            hourly_tasks[hour]['failed'] += 1
+    
+    # Calculate crash impact
+    hourly_crashes = {}
+    for ts, crash_count, oom_count, rate_limit_count, api_error_count in crash_rows:
+        hour = int(parse_timestamp(ts) // 3600) * 3600
+        if hour not in hourly_crashes:
+            hourly_crashes[hour] = {'crashes': 0, 'oom': 0, 'rate_limits': 0, 'api_errors': 0}
+        
+        hourly_crashes[hour]['crashes'] += int(crash_count or 0)
+        hourly_crashes[hour]['oom'] += int(oom_count or 0)
+        hourly_crashes[hour]['rate_limits'] += int(rate_limit_count or 0)
+        hourly_crashes[hour]['api_errors'] += int(api_error_count or 0)
+    
+    # Process resource metrics
+    for ts, cpu_load, mem_pct, workers, blocked_load, blocked_mem in resource_rows:
+        business_data['resource_efficiency'].append({
+            'ts': int(parse_timestamp(ts)),
+            'cpu_efficiency': max(0, 100 - (float(cpu_load or 0))),  # Available capacity
+            'memory_efficiency': max(0, 100 - (float(mem_pct or 0))),
+            'worker_efficiency': int(workers or 0),
+            'blocked_by_load': int(blocked_load or 0),
+            'blocked_by_memory': int(blocked_mem or 0)
+        })
+    
+    # Calculate SATs/task cost
+    sats_per_token, _ = compute_sats_per_token()
+    for hour_ts, tokens, calls, success_calls in api_hourly:
+        tasks_in_hour = hourly_tasks.get(float(hour_ts), {'completed': 0, 'failed': 0})
+        completed_tasks = tasks_in_hour['completed']
+        total_tasks = tasks_in_hour['completed'] + tasks_in_hour['failed']
+        
+        if completed_tasks > 0 and tokens > 0:
+            sats_burned = float(tokens) * sats_per_token.get('ours', 0)
+            sats_per_task = sats_burned / completed_tasks if completed_tasks > 0 else 0
+            sats_per_call = sats_burned / float(calls) if calls > 0 else 0
+            
+            crashes_in_hour = hourly_crashes.get(float(hour_ts), {'crashes': 0})
+            crash_free_rate = (1 - crashes_in_hour['crashes'] / max(1, total_tasks)) * 100 if total_tasks > 0 else 100
+            
+            business_data['cost_efficiency'].append({
+                'ts': int(parse_timestamp(hour_ts)),
+                'sats_burned': sats_burned,
+                'tasks_completed': completed_tasks,
+                'total_calls': int(calls),
+                'success_rate': (int(success_calls) / int(calls) * 100) if calls > 0 else 0,
+                'sats_per_task': sats_per_task,
+                'sats_per_call': sats_per_call,
+                'crash_free_rate': crash_free_rate
+            })
+    
+    # Convert task and crash data to time series
+    all_hours = sorted(set(list(hourly_tasks.keys()) + list(hourly_crashes.keys()) + 
+                         [int(parse_timestamp(r[0])) for r in resource_rows] + [int(float(r[0])) for r in api_hourly]))
+    
+    for hour in all_hours:
+        tasks = hourly_tasks.get(hour, {'completed': 0, 'failed': 0, 'total_time': 0})
+        crashes = hourly_crashes.get(hour, {'crashes': 0, 'oom': 0, 'rate_limits': 0, 'api_errors': 0})
+        
+        business_data['tasks_completed'].append({'ts': hour, 'value': tasks['completed']})
+        business_data['tasks_failed'].append({'ts': hour, 'value': tasks['failed']})
+        business_data['crash_events'].append({
+            'ts': hour,
+            'crashes': crashes['crashes'],
+            'oom': crashes['oom'],
+            'rate_limits': crashes['rate_limits'],
+            'api_errors': crashes['api_errors']
+        })
+        
+        # Calculate SATs per task (aggregate)
+        if tasks['completed'] > 0:
+            # Find corresponding API data for this hour
+            api_data = next((r for r in api_hourly if int(float(r[0])) == hour), None)
+            if api_data:
+                tokens = float(api_data[1])
+                sats_burned = tokens * sats_per_token.get('ours', 0)
+                sats_per_task = sats_burned / tasks['completed']
+                business_data['sats_per_task'].append({'ts': hour, 'value': sats_per_task})
+            else:
+                business_data['sats_per_task'].append({'ts': hour, 'value': 0})
+        else:
+            business_data['sats_per_task'].append({'ts': hour, 'value': 0})
+    
+    return business_data
 
 
 def generate_data_json():
@@ -194,7 +409,7 @@ def generate_data_json():
     api_stats = db.execute("""
         SELECT
             CAST(ts / 3600 AS INTEGER) * 3600 as hour_ts,
-            key_name,
+            CASE WHEN ollama_hit = 1 THEN 'ollama' ELSE key_name END as effective_key,
             COUNT(*) as calls,
             SUM(total_tokens) as tokens,
             SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
@@ -202,25 +417,28 @@ def generate_data_json():
             AVG(duration_ms) as avg_duration
         FROM api_calls
         WHERE ts > (SELECT MAX(ts) - 86400*7 FROM api_calls)
-        GROUP BY hour_ts, key_name
+        GROUP BY hour_ts, effective_key
         ORDER BY hour_ts ASC
     """).fetchall()
 
     # Key summary
     key_summary = db.execute("""
-        SELECT key_name,
+        SELECT CASE WHEN ollama_hit = 1 THEN 'ollama' ELSE key_name END as effective_key,
             COUNT(*) as calls,
             SUM(total_tokens) as tokens,
             SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END) as cache_hits,
             SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) as success
         FROM api_calls
-        GROUP BY key_name
+        GROUP BY effective_key
     """).fetchall()
-
-    db.close()
 
     # Price computation
     sats_per_token, btc_price = compute_sats_per_token()
+    
+    # Business metrics
+    business_metrics = get_business_metrics(db)
+
+    db.close()
 
     # Anomalies with detail
     anomalies = []
@@ -310,6 +528,7 @@ def generate_data_json():
         "api_hourly_sats": sats_hourly,
         "key_summaries": key_summaries,
         "price_info": price_info,
+        "business_metrics": business_metrics,
     }
 
     with open(OUT_JSON, "w") as f:
@@ -356,6 +575,7 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 .kpi-friend{background:#3d2a1a;color:#f0a050;}
 .kpi-ppq{background:#2a1a3d;color:#bb86fc;}
 .kpi-none{background:#333;color:#888;}
+.kpi-ollama{background:#1a3a3a;color:#4ec9b0;}
 </style>
 </head>
 <body>
@@ -393,6 +613,23 @@ td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left;vertical-a
 <h2>Recent Anomalies <span class="note"> with detailed explanations</span></h2>
 <div id="anomContainer"></div>
 
+<h2>Business KPI Cards <span class="note"> SATs/task cost and efficiency metrics</span></h2>
+<div class="grid">
+  <div class="card"><h3>SATs/Task Cost</h3><div class="v" id="satsPerTask" style="color:#58a6ff">...</div><div class="note">current rate</div></div>
+  <div class="card"><h3>Crash-Free Rate</h3><div class="v" id="crashFreeRate" style="color:#7ee787">...</div><div class="note">task completion %</div></div>
+  <div class="card"><h3>Resource Efficiency</h3><div class="v" id="resourceEfficiency" style="color:#f0a050">...</div><div class="note">avg utilization</div></div>
+  <div class="card"><h3>Cost Trend</h3><div class="v" id="costTrend" style="color:#bb86fc">...</div><div class="note">7-day change</div></div>
+</div>
+
+<h2>Cost Efficiency Chart <button class="toggle" id="costLogToggle" onclick="toggleCostLog()">Log Scale</button> <span class="note"> SATs burned vs tasks completed</span></h2>
+<div class="chart" id="costChart"></div>
+
+<h2>Crash Impact Analysis <span class="note"> crashes overlaid on business metrics</span></h2>
+<div class="chart" id="crashChart"></div>
+
+<h2>Resource Cost Analysis <span class="note"> Memory/CPU usage vs business value</span></h2>
+<div class="chart" id="resourceChart"></div>
+
 </div>
 
 <p style="margin-top:40px;padding-top:16px;border-top:1px solid #30363d;color:#8b949e;font-size:0.8em;">
@@ -404,6 +641,7 @@ const dark = {paper_bgcolor:'#161b22',plot_bgcolor:'#0d1117',font:{color:'#c9d1d
 const ax = {gridcolor:'#30363d'};
 var logScale = false;
 var c3LogScale = false;
+var costLogScale = false;
 var chartsReady = false;
 var currentData = null;
 
@@ -432,6 +670,14 @@ function toggleC3Log() {
     if (currentData) renderCharts(currentData);
 }
 
+function toggleCostLog() {
+    costLogScale = !costLogScale;
+    var btn = document.getElementById('costLogToggle');
+    btn.textContent = costLogScale ? 'Linear' : 'Log Scale';
+    btn.classList.toggle('active', costLogScale);
+    if (currentData) renderBusinessCharts(currentData);
+}
+
 function formatSats(n) {
     if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
     if (n >= 1000) return (n/1000).toFixed(1) + 'K';
@@ -455,7 +701,7 @@ function renderCharts(data) {
         yConfig.type = 'log';
         yConfig.autorange = true;
     }
-    var projTrace = {x:ts, y:proj, mode:'lines', name:'Predicted %', line:{color:'#58a6ff'}};
+    var projTrace = {x:ts, y:proj, mode:'markers', name:'Predicted %', marker:{size:4,color:'#58a6ff'}};
     var usedTrace = {x:ts, y:used, mode:'markers', marker:{size:2,color:'#d29922'}, name:'Observed %'};
 
     var shapes = [];
@@ -482,11 +728,13 @@ function renderCharts(data) {
     var satsData = data.api_hourly_sats;
     if (satsData) {
         var traces = [];
-        var keyColors = {ours:'#58a6ff', friend:'#f0a050', ppq:'#bb86fc', None:'#888'};
+        var keyColors = {ours:'#58a6ff', friend:'#f0a050', ppq:'#bb86fc', ollama:'#4ec9b0', None:'#888'};
 
         var hasPpq = false;
+        var hasOllama = false;
         for (var key in satsData) {
             if (key === 'ppq' && satsData[key].sats.some(s => s > 0)) hasPpq = true;
+            if (key === 'ollama' && satsData[key].sats.some(s => s > 0)) hasOllama = true;
         }
 
         for (var key in satsData) {
@@ -503,10 +751,9 @@ function renderCharts(data) {
             traces.push({
                 x: xVals,
                 y: yVals,
-                mode: 'lines+markers',
+                mode: 'markers',
                 name: key,
-                line: {color: keyColors[key] || '#888', width: 1.5},
-                marker: {size: 3, color: keyColors[key] || '#888'},
+                marker: {size: 4, color: keyColors[key] || '#888'},
             });
         }
 
@@ -518,7 +765,8 @@ function renderCharts(data) {
 
         Plotly.react('c3', traces,
             {...dark, title:'API Cost by Key (SATs/hr)'
-                + (hasPpq ? '  PPQ included' : ''),
+                + (hasPpq ? '  PPQ included' : '')
+                + (hasOllama ? '  Ollama included' : ''),
              xaxis:ax, yaxis:c3yConfig},
             {responsive:true});
     }
@@ -596,6 +844,177 @@ function renderAnomalies(data) {
     document.getElementById('anomContainer').innerHTML = html;
 }
 
+function renderBusinessKPIs(data) {
+    if (!data.business_metrics) return;
+    
+    var bm = data.business_metrics;
+    var currentSatsPerTask = 0;
+    var currentCrashFreeRate = 100;
+    var currentResourceEfficiency = 0;
+    var costTrend = 0;
+    
+    // Calculate current KPI values
+    if (bm.sats_per_task && bm.sats_per_task.length > 0) {
+        var latest = bm.sats_per_task[bm.sats_per_task.length - 1];
+        var oldest = bm.sats_per_task[0];
+        currentSatsPerTask = latest.value || 0;
+        costTrend = oldest.value > 0 ? ((latest.value - oldest.value) / oldest.value * 100) : 0;
+    }
+    
+    if (bm.cost_efficiency && bm.cost_efficiency.length > 0) {
+        var latest = bm.cost_efficiency[bm.cost_efficiency.length - 1];
+        currentCrashFreeRate = latest.crash_free_rate || 100;
+    }
+    
+    if (bm.resource_efficiency && bm.resource_efficiency.length > 0) {
+        var latest = bm.resource_efficiency[bm.resource_efficiency.length - 1];
+        currentResourceEfficiency = Math.round((latest.cpu_efficiency + latest.memory_efficiency) / 2);
+    }
+    
+    document.getElementById('satsPerTask').textContent = formatSats(currentSatsPerTask);
+    document.getElementById('crashFreeRate').textContent = currentCrashFreeRate.toFixed(1) + '%';
+    document.getElementById('resourceEfficiency').textContent = currentResourceEfficiency + '%';
+    
+    var trendElement = document.getElementById('costTrend');
+    if (costTrend > 0) {
+        trendElement.textContent = '+' + costTrend.toFixed(1) + '%';
+        trendElement.style.color = '#f85149';
+    } else if (costTrend < 0) {
+        trendElement.textContent = costTrend.toFixed(1) + '%';
+        trendElement.style.color = '#7ee787';
+    } else {
+        trendElement.textContent = '0.0%';
+        trendElement.style.color = '#f0a050';
+    }
+}
+
+function renderBusinessCharts(data) {
+    if (!data.business_metrics) return;
+    
+    var bm = data.business_metrics;
+    
+    // Cost Efficiency Chart - SATs burned vs tasks completed
+    if (bm.cost_efficiency && bm.cost_efficiency.length > 0) {
+        var times = [];
+        var satsBurned = [];
+        var tasksCompleted = [];
+        
+        for (var i = 0; i < bm.cost_efficiency.length; i++) {
+            var item = bm.cost_efficiency[i];
+            times.push(new Date(item.ts * 1000));
+            satsBurned.push(item.sats_burned);
+            tasksCompleted.push(item.tasks_completed);
+        }
+        
+        var satsTrace = {
+            x: times,
+            y: satsBurned,
+            type: 'bar',
+            name: 'SATs Burned',
+            yaxis: 'y',
+            marker: {color: '#58a6ff'}
+        };
+        
+        var tasksTrace = {
+            x: times,
+            y: tasksCompleted,
+            type: 'scatter',
+            mode: 'markers',
+            name: 'Tasks Completed',
+            yaxis: 'y2',
+            marker: {color: '#7ee787', size: 4}
+        };
+        
+        var yConfig = {...ax, title: 'SATs', type: costLogScale ? 'log' : 'linear', autorange: true};
+        
+        Plotly.react('costChart', [satsTrace, tasksTrace],
+            {...dark, title: 'SATs Burned vs Tasks Completed',
+             xaxis: {...ax, title: 'Time'},
+             yaxis: yConfig,
+             yaxis2: {...ax, title: 'Tasks', side: 'right', overlaying: 'y'}},
+            {responsive: true});
+    }
+    
+    // Crash Impact Analysis
+    if (bm.crash_events && bm.crash_events.length > 0) {
+        var times = [];
+        var crashes = [];
+        var tasks = [];
+        
+        for (var i = 0; i < bm.crash_events.length; i++) {
+            var item = bm.crash_events[i];
+            times.push(new Date(item.ts * 1000));
+            crashes.push(item.crashes);
+            
+            // Find corresponding tasks for this hour
+            var taskData = bm.tasks_completed.find(t => t.ts === item.ts);
+            tasks.push(taskData ? taskData.value : 0);
+        }
+        
+        var crashTrace = {
+            x: times,
+            y: crashes,
+            type: 'bar',
+            name: 'Crashes',
+            yaxis: 'y',
+            marker: {color: '#f85149'}
+        };
+        
+        var taskTrace = {
+            x: times,
+            y: tasks,
+            type: 'scatter',
+            mode: 'markers',
+            name: 'Tasks Completed',
+            yaxis: 'y2',
+            marker: {color: '#7ee787', size: 4}
+        };
+        
+        Plotly.react('crashChart', [crashTrace, taskTrace],
+            {...dark, title: 'Crash Impact on Task Completion',
+             xaxis: {...ax, title: 'Time'},
+             yaxis: {...ax, title: 'Crashes'},
+             yaxis2: {...ax, title: 'Tasks', side: 'right', overlaying: 'y'}},
+            {responsive: true});
+    }
+    
+    // Resource Cost Analysis
+    if (bm.resource_efficiency && bm.resource_efficiency.length > 0) {
+        var times = [];
+        var cpuEff = [];
+        var memEff = [];
+        
+        for (var i = 0; i < bm.resource_efficiency.length; i++) {
+            var item = bm.resource_efficiency[i];
+            times.push(new Date(item.ts * 1000));
+            cpuEff.push(item.cpu_efficiency);
+            memEff.push(item.memory_efficiency);
+        }
+        
+        var cpuTrace = {
+            x: times,
+            y: cpuEff,
+            mode: 'markers',
+            name: 'CPU Efficiency',
+            marker: {color: '#58a6ff', size: 4}
+        };
+        
+        var memTrace = {
+            x: times,
+            y: memEff,
+            mode: 'markers',
+            name: 'Memory Efficiency',
+            marker: {color: '#f0a050', size: 4}
+        };
+        
+        Plotly.react('resourceChart', [cpuTrace, memTrace],
+            {...dark, title: 'Resource Efficiency vs Business Value',
+             xaxis: ax,
+             yaxis: {...ax, title: 'Efficiency (%)'}},
+            {responsive: true});
+    }
+}
+
 function render(data) {
     currentData = data;
     const lastIdx = data.burn_rate.length - 1;
@@ -613,6 +1032,8 @@ function render(data) {
     renderSwitchLog(data);
     renderKeySummary(data);
     renderAnomalies(data);
+    renderBusinessKPIs(data);
+    renderBusinessCharts(data);
     chartsReady = true;
 }
 
